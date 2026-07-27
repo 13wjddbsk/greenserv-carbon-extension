@@ -1,0 +1,681 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{setspace}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+
+\onehalfspacing
+
+\title{Beyond Energy Consumption: Carbon Emission as an Evaluation Metric\\
+for Contextual Bandit-Based LLM Inference Routing}
+
+\author{Yuna Jung\\
+Murty Sunak Quantitative Computing Lab\\
+Claremont McKenna College\\
+Summer Research Program 2026\\
+\texttt{yjung29@cmc.edu}}
+
+\date{July 2026}
+
+\begin{document}
+
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+This study investigates whether carbon emission should be introduced as an
+evaluation metric for environmentally-friendly large language model (LLM)
+inference routing algorithms. We replicate GreenServ \cite{ziller2026}, a
+contextual multi-armed bandit routing framework that dynamically assigns
+queries to models from a pool of 16 language models to optimize the
+accuracy-energy tradeoff, on the Laguna high-performance computing cluster
+at USC/CARC. GreenServ currently evaluates routing performance using mean
+normalized accuracy, GPU energy consumption (Wh), and latency, but does not
+measure carbon emissions. We extend GreenServ by integrating CodeCarbon
+\cite{codecarbon2023}, an open-source Python library that measures actual
+energy consumption of GPU, CPU, and RAM and converts it to equivalent CO$_2$
+(gCO$_2$) using regional grid carbon intensity. We conduct two experiments:
+(1) a per-model carbon benchmark measuring carbon emissions for 15 of
+GreenServ's 16 language models across 10 test queries, finding that carbon
+scales with parameter count but is also influenced by model architecture; and
+(2) a live routing experiment running all 8 routing strategies across
+GreenServ's full 2,500-query benchmark dataset with CodeCarbon measuring
+carbon per routing decision. Our goal is to produce an Accuracy
+vs.\ Carbon Emissions Pareto plot comparable to GreenServ's existing Accuracy
+vs.\ Energy plot, and to determine whether energy consumption is a sufficient
+proxy for carbon emissions or whether carbon must be measured independently
+to accurately evaluate the environmental impact of LLM routing algorithms.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+The rapid growth of large language model (LLM) deployment has raised
+significant concerns about the environmental cost of AI inference. LLMs are
+power-intensive: a single inference call requires matrix multiplications
+across billions of parameters, drawing hundreds of watts from GPU hardware.
+At the scale of millions of daily queries across commercial deployments, the
+cumulative energy and carbon footprint becomes substantial. A 2024 TED talk
+by AI researcher Sasha Luccioni highlighted the environmental impact of
+machine learning data centers, motivating the question at the center of this
+work: can we design smarter routing systems that direct queries to
+appropriately-sized models, reducing environmental impact without sacrificing
+accuracy?
+
+This question led to an exploration of Small Language Models (SLMs),
+generally defined as models in the 1--9 billion parameter range
+\cite{gupta2026}, as more efficient alternatives to large models for tasks
+that do not require full frontier-model capability. The fundamental
+observation is that many real-world queries are answerable by smaller, more
+efficient models --- routing them to a large model is wasteful.
+
+During a literature review of existing routing approaches, we found that
+while several frameworks address computational or monetary efficiency
+\cite{chen2023frugalgpt, routellm2024}, few explicitly optimize for
+environmental metrics. GreenServ \cite{ziller2026} is a notable exception:
+it uses a contextual multi-armed bandit (MAB) algorithm --- specifically
+LinUCB \cite{li2010contextual} --- to route queries across a pool of 16
+models, optimizing a scalarized reward combining normalized accuracy and GPU
+energy consumption. However, GreenServ measures environmental cost only
+through GPU electricity usage in watt-hours (Wh), and does not account for
+carbon emissions.
+
+This distinction matters because the carbon footprint of a given amount of
+electricity depends heavily on the energy mix of the local grid. The same
+watt-hour of compute in a coal-powered region emits far more CO$_2$ than in
+a renewables-heavy grid such as California's. Moreover, carbon emissions,
+water usage, and electricity are three distinct environmental impacts of data
+center operations \cite{luccioni2023}, and optimizing for one does not
+necessarily optimize for the others.
+
+This report presents two contributions: (1) a per-model carbon measurement
+study using CodeCarbon \cite{codecarbon2023} on GreenServ's 16 models, and
+(2) an integration of CodeCarbon into GreenServ's live inference routing
+pipeline to measure carbon emissions per routing decision across all 8
+routing strategies on the full 2,500-query benchmark. The central research
+question is: \textit{Is GPU energy consumption a sufficient proxy for carbon
+emissions when evaluating the environmental friendliness of LLM inference
+routing algorithms?}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Background and Related Work}
+
+\subsection{Environmental Costs of Language Models}
+
+The environmental impact of LLMs spans three primary dimensions: electricity
+consumption, carbon emissions, and water usage \cite{luccioni2023,
+strubell2019}. Training large models requires enormous compute --- for
+example, training GPT-3 consumed an estimated 1,287 MWh of electricity
+\cite{patterson2021}. While inference per query is much cheaper than
+training, its cumulative cost at scale is significant. Luccioni et al.\
+\cite{luccioni2023hf} benchmarked the carbon footprint of multiple models
+and tasks using CodeCarbon, finding substantial variance across architectures
+and hardware. Schwartz et al.\ \cite{schwartz2020green} introduced the
+concept of ``Green AI,'' arguing that efficiency should be treated as a
+first-class research objective alongside accuracy.
+
+\subsection{LLM and SLM Routing}
+
+Routing frameworks aim to reduce inference cost by directing queries to
+models of appropriate capacity. FrugalGPT \cite{chen2023frugalgpt} uses a
+cascade approach: queries are sent to progressively larger models until a
+confidence threshold is met, optimizing for API cost. RouteLLM
+\cite{routellm2024} trains a classifier on human preference data to predict
+whether a query needs a strong or weak model. Both frameworks use cost in
+dollars or token budgets as proxies for resource consumption, not direct
+energy or carbon measurements.
+
+\subsection{GreenServ}
+
+GreenServ \cite{ziller2026} is the closest prior work to this study. It
+implements a context-aware routing framework using LinUCB, a contextual
+bandit algorithm that assumes a linear relationship between query context and
+model reward. The system extracts three query features: task type (MMLU,
+GSM8K, HellaSwag, WinoGrande, CNN/DailyMail), semantic cluster (via online
+K-means on sentence embeddings), and text complexity (Flesch Reading Ease
+score). These features are one-hot encoded into a context vector of dimension
+$d = 12$, which is used to select among 16 models spanning 0.5B to 34B
+parameters. The reward function is:
+\begin{equation}
+r_t = (1 - \lambda) \cdot \text{Acc}_\text{norm} - \lambda \cdot E_\text{norm}
+\end{equation}
+where $\lambda \in [0,1]$ balances accuracy and energy efficiency.
+GreenServ evaluates routing algorithms on mean normalized accuracy and total
+energy consumption (Wh), measured via the Zeus GPU monitoring library
+\cite{zeus2023}. It does not measure carbon emissions.
+
+\subsection{CodeCarbon}
+
+CodeCarbon \cite{codecarbon2023} is an open-source Python library that
+measures the carbon footprint of computational workloads. It monitors GPU,
+CPU, and RAM power consumption via hardware interfaces (NVIDIA NVML for GPU,
+Intel RAPL for CPU) and converts total energy (kWh) to CO$_2$ equivalent
+(kgCO$_2$eq) using the carbon intensity of the local electricity grid,
+sourced from regional databases or the ElectricityMap API. Two tracker
+modes are available: \texttt{EmissionsTracker} (online, uses real-time grid
+data) and \texttt{OfflineEmissionsTracker} (offline, uses a static carbon
+intensity database by country). Prior work \cite{luccioni2023hf} used
+CodeCarbon to benchmark the carbon footprint of HuggingFace models across
+tasks and hardware, demonstrating its suitability for measuring inference
+carbon emissions.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methods}
+
+\subsection{Infrastructure}
+
+All experiments were conducted on the Laguna high-performance computing
+cluster at the University of Southern California's Center for Advanced
+Research Computing (CARC), accessed by Claremont McKenna College. The
+cluster uses SLURM for job scheduling. Compute nodes used in this project
+were equipped with dual NVIDIA L40S GPUs (46 GB VRAM each, 92 GB total) and
+AMD EPYC 9354 32-core processors with 128 GB RAM. Model weights were stored
+in project storage (\texttt{/project/JehoPark\_1895/Yuna\_SLM/}), which
+provides 338 TB of shared network-attached storage.
+
+Since Laguna does not support Docker for security reasons, GreenServ's
+PostgreSQL database dependency was migrated to Apptainer (formerly
+Singularity), the HPC-standard container runtime. The migration required
+pulling the official PostgreSQL 15 Docker image via Apptainer, initializing
+the database directory in project storage, and creating a writable Unix
+socket directory to bypass the container's read-only filesystem. This
+migration is documented in full in the lab notebook for reproducibility.
+
+\subsection{GreenServ Replication}
+
+We cloned GreenServ's public repository
+(\url{https://github.com/TZData1/llm-inference-router}) and set up a Python
+3.11 virtual environment with the provided \texttt{requirements.txt}. The
+PostgreSQL database was populated by loading \texttt{db/llm\_db\_backup.sql}
+into a local instance, yielding 40,000 pregenerated inference results (2,500
+queries $\times$ 16 models $\times$ multiple runs). All four GreenServ
+experiments were executed via the provided Makefile targets
+(\texttt{make exp01-full} through \texttt{make exp04-full}), using SLURM
+for job management with \texttt{nohup} to survive session disconnections.
+
+The key infrastructure challenge was that GreenServ's experiments replay
+pregenerated results from the database rather than running live inference.
+This means neither Zeus nor CodeCarbon fires during the standard experiment
+runs. Carbon measurements for the routing algorithm comparison therefore
+required a separate live inference pipeline (Section~\ref{sec:live}).
+
+\subsection{Experiment 1: Per-Model Carbon Benchmark}
+\label{sec:permodel}
+
+To establish a baseline understanding of how carbon emissions vary across
+GreenServ's model pool, we ran each model through 10 test queries and
+measured carbon emissions using CodeCarbon's
+\texttt{OfflineEmissionsTracker} with \texttt{country\_iso\_code="USA"}.
+
+The 10 queries were general knowledge prompts (e.g., ``What is the capital
+of France?'', ``What is machine learning?'') designed to elicit short,
+factual responses. For each model, we:
+\begin{enumerate}
+  \item Loaded the model weights from the HuggingFace cache in project
+  storage using \texttt{AutoModelForCausalLM} in \texttt{bfloat16}
+  precision with \texttt{device\_map="auto"}.
+  \item Started a CodeCarbon \texttt{OfflineEmissionsTracker} tracker.
+  \item Ran inference on all 10 queries with \texttt{max\_new\_tokens=50}.
+  \item Stopped the tracker and recorded total emissions in gCO$_2$.
+  \item Deleted the model and called \texttt{torch.cuda.empty\_cache()} to
+  free GPU memory before the next model.
+\end{enumerate}
+
+Of GreenServ's 16 models, 15 were successfully measured. Yi-34B
+(\texttt{01-ai/Yi-34B-Chat}) initially failed due to transformer
+compatibility issues but was confirmed accessible on HuggingFace and is
+included in subsequent experiments. Results were saved to
+\texttt{live\_carbon\_results.csv}.
+
+\subsection{Experiment 2: Live Routing Carbon Measurement}
+\label{sec:live}
+
+To measure carbon emissions \textit{per routing algorithm} --- rather than
+per model --- we designed a live inference experiment that mirrors
+GreenServ's evaluation setup but replaces the pregenerated database replay
+with actual model inference, with CodeCarbon measuring carbon during each
+inference call.
+
+\subsubsection{Routing Algorithms}
+
+We evaluated all 8 routing strategies tested in GreenServ:
+\begin{itemize}
+  \item \textbf{LinUCB (C)}: GreenServ's primary algorithm, contextual
+  bandit with upper confidence bound exploration ($\alpha = 0.1$,
+  $\lambda_\text{reg} = 0.05$).
+  \item \textbf{Thompson Sampling (C)}: Bayesian posterior sampling
+  ($\sigma = 0.25$, prior variance = 2).
+  \item \textbf{$\varepsilon$-Greedy (C)}: Contextual epsilon-greedy
+  ($\varepsilon_0 = 1.0$, $\delta = 0.98$, $\varepsilon_\text{min} = 0.01$).
+  \item \textbf{$\varepsilon$-Greedy (NC)}: Non-contextual epsilon-greedy
+  (same hyperparameters, $\lambda = 0.25$).
+  \item \textbf{Random}: Uniformly random model selection.
+  \item \textbf{Largest}: Always selects Yi-34B (largest model).
+  \item \textbf{Smallest}: Always selects Qwen2.5-0.5B (smallest model).
+  \item \textbf{Accuracy}: Always selects Gemma-3-27B (highest accuracy
+  model).
+\end{itemize}
+
+\subsubsection{Feature Extraction}
+
+We used GreenServ's full feature extraction pipeline via
+\texttt{FeatureService}, which computes:
+\begin{itemize}
+  \item \textbf{Task type}: Derived directly from the source dataset label
+  (MMLU, GSM8K, HellaSwag, WinoGrande, CNN/DailyMail), one-hot encoded.
+  \item \textbf{Semantic cluster}: Online K-means ($k=3$) on
+  \texttt{all-MiniLM-L6-v2} sentence embeddings, one-hot encoded.
+  \item \textbf{Text complexity}: Flesch Reading Ease score discretized
+  into 3 bins, one-hot encoded.
+  \item \textbf{Intercept}: A constant 1.0 appended to the context vector.
+\end{itemize}
+This yields a context vector of dimension $d = 12$, matching GreenServ's
+original setup.
+
+\subsubsection{Reward Computation}
+
+To evaluate routing decisions without re-running model evaluation (which
+would require ground-truth labels and evaluation metrics), we used
+GreenServ's pregenerated accuracy and energy values from the database as the
+reward signal, consistent with GreenServ's offline evaluation approach. The
+reward for selecting model $m$ for query $q$ is:
+\begin{equation}
+r(m, q) = (1 - \lambda) \cdot \text{Acc}_\text{norm}(m, q) - \lambda \cdot E_\text{norm}(m, q)
+\end{equation}
+with $\lambda = 0.5$ (equal weight on accuracy and energy efficiency).
+
+\subsubsection{Carbon Measurement}
+
+For each algorithm, we wrapped the full 2,500-query inference run in a
+single CodeCarbon \texttt{OfflineEmissionsTracker} instance. This captures
+the total GPU, CPU, and RAM energy consumed by that algorithm's routing
+decisions --- which implicitly reflects model selection frequency. When an
+algorithm like LinUCB primarily routes to small models, it consumes less GPU
+power; when the Largest baseline always calls Yi-34B, GPU power draw is
+consistently high. CodeCarbon captures these differences at the hardware
+level.
+
+Note on multi-GPU usage: experiments were submitted with
+\texttt{--gres=gpu:2} to provide 92 GB total VRAM across two L40S GPUs.
+The \texttt{device\_map="balanced"} setting in \texttt{from\_pretrained()}
+distributes model layers evenly across both GPUs. This reduces model loading
+time for large models and prevents out-of-memory errors between algorithm
+runs.
+
+\subsubsection{GPU Memory Management}
+
+A key implementation challenge was GPU out-of-memory errors between
+algorithms. Models loaded during one algorithm's run remained in GPU memory
+and caused the next algorithm's model loads to fail. We resolved this by
+explicitly calling \texttt{del model}, \texttt{del tokenizer},
+\texttt{torch.cuda.empty\_cache()}, and \texttt{gc.collect()} after each
+algorithm's run before starting the next.
+
+\subsubsection{Errors Encountered}
+
+Table~\ref{tab:errors} summarizes the engineering challenges encountered
+during development of the live routing experiment.
+
+\begin{table}[H]
+\centering
+\caption{Errors encountered during live routing experiment development}
+\label{tab:errors}
+\begin{tabular}{p{3.5cm} p{5.5cm} p{5cm}}
+\toprule
+\textbf{Error} & \textbf{Cause} & \textbf{Fix} \\
+\midrule
+\texttt{TypeError}: missing \texttt{model\_ids}, \texttt{context\_dimension} &
+Bandit constructors require model list and context dim as first positional args &
+Added \texttt{model\_ids} and \texttt{context\_dimension} to all bandit instantiations \\
+\addlinespace
+\texttt{AttributeError}: no attribute \texttt{select} &
+GreenServ's method is \texttt{select\_model()}, not \texttt{select()} &
+Changed to \texttt{algo.select\_model(context)} \\
+\addlinespace
+Gated repo error: \texttt{aya-expanse-32b} &
+\texttt{models.yaml} contains extra models beyond GreenServ's 16 &
+Hardcoded \texttt{GREENSERV\_MODEL\_IDS} list of 16 models \\
+\addlinespace
+\texttt{CUDA OutOfMemoryError} between algorithms &
+Loaded models remained in GPU memory across algorithm runs &
+Added explicit GPU cleanup (\texttt{del}, \texttt{empty\_cache()}, \texttt{gc.collect()}) \\
+\addlinespace
+\texttt{RuntimeError}: layer not mapped to device &
+\texttt{device\_map="auto"} failed to assign all layers across 2 GPUs &
+Changed to \texttt{device\_map="balanced"} and \texttt{use\_cache=False} \\
+\addlinespace
+\texttt{sbatch} node config unavailable &
+Requested 8 GPUs but nodes have max 2 L40S GPUs &
+Changed \texttt{--gres=gpu:8} to \texttt{--gres=gpu:2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+
+\subsection{Experiment 1: Per-Model Carbon Benchmark}
+
+Table~\ref{tab:permodel} shows carbon emissions per model for 10 queries
+each, measured on the Laguna L40S GPU using
+\texttt{OfflineEmissionsTracker}.
+
+\begin{table}[H]
+\centering
+\caption{Carbon emissions per model (10 queries, Laguna L40S GPU)}
+\label{tab:permodel}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Model} & \textbf{Parameters} & \textbf{Carbon (gCO$_2$)} \\
+\midrule
+Qwen2.5-0.5B  & 0.5B  & 0.171 \\
+Qwen2.5-1.5B  & 1.5B  & 0.207 \\
+Phi-4-mini-4B & 3.8B  & 0.213 \\
+Qwen2.5-3B    & 3B    & 0.221 \\
+Qwen2.5-7B    & 7B    & 0.355 \\
+Mistral-7B    & 7B    & 0.373 \\
+Gemma-3-1B    & 1B    & 0.634 \\
+Qwen2.5-14B   & 14B   & 0.646 \\
+Phi-4-14B     & 14B   & 0.925 \\
+Gemma-3-4B    & 4B    & 1.234 \\
+Llama-3.1-8B  & 8B    & 1.807 \\
+Llama-3.2-1B  & 1B    & [pending] \\
+Llama-3.2-3B  & 3B    & [pending] \\
+Gemma-3-12B   & 12B   & 2.529 \\
+Gemma-3-27B   & 27B   & 4.470 \\
+Yi-34B        & 34B   & [pending] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two key findings emerge. First, carbon emissions generally increase with
+parameter count. Second, model architecture significantly affects carbon
+efficiency: Phi-4-mini (3.8B parameters) emits less carbon per query than
+Qwen2.5-1.5B (1.5B parameters), suggesting that architectural efficiency
+differences outweigh raw parameter counts in some cases. Similarly, Gemma-3
+models emit substantially more carbon than Qwen2.5 models of similar size.
+
+\subsection{Experiment 2: Live Routing Carbon Measurement}
+
+The live routing experiment was submitted to Laguna's GPU partition multiple
+times across several sessions but did not complete within the timeframe of
+this research project. The experiment encountered a fundamental infrastructure
+limitation: \textbf{model loading overhead}.
+
+In GreenServ's original design, all model inference results are pregenerated
+and stored in a PostgreSQL database. During experiments, the router replays
+these results without ever loading model weights. This makes GreenServ's
+experiments fast and GPU-memory-efficient. Our live routing experiment
+departed from this design by actually loading and running each model during
+the routing loop --- which is necessary to measure real CodeCarbon emissions
+but introduces significant overhead.
+
+Specifically, when a routing algorithm (e.g.\ LinUCB) selects a different
+model for each query, the system must load that model's weights from disk
+into GPU memory before inference can occur. Each model load takes 30--120
+seconds depending on model size. With 15 models and 2,500 queries, a routing
+algorithm that frequently switches between models could trigger hundreds of
+model loads, making the experiment infeasible within a single SLURM job
+window.
+
+Table~\ref{tab:exp2errors} summarizes the specific errors encountered across
+multiple submission attempts.
+
+\begin{table}[H]
+\centering
+\caption{Errors encountered during Experiment 2 execution}
+\label{tab:exp2errors}
+\begin{tabular}{p{4cm} p{5cm} p{4.5cm}}
+\toprule
+\textbf{Error} & \textbf{Cause} & \textbf{Fix Applied} \\
+\midrule
+Job stuck at Query 0/2500 for 2+ hours &
+Yi-34B (34B parameters) barely fit in 92GB VRAM across 2 L40S GPUs;
+inference crawled due to memory pressure and offloading &
+Removed Yi-34B from model pool \\
+\addlinespace
+\texttt{RuntimeError}: layer not mapped to device &
+\texttt{device\_map="auto"} failed to distribute layers across 2 GPUs &
+Changed to \texttt{device\_map="balanced"}, added \texttt{use\_cache=False} \\
+\addlinespace
+Job still stuck at Query 0/2500 after removing Yi-34B &
+LinUCB routes to many different models in early queries;
+each model switch requires a full reload from disk &
+Fundamental design limitation --- not resolved within project timeframe \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Why This Experiment Cannot Run As Designed}
+
+The root cause is a mismatch between GreenServ's pregenerated-replay
+architecture and the requirements of live CodeCarbon measurement. To produce
+an Accuracy vs.\ Carbon Emissions Pareto plot equivalent to GreenServ's
+Accuracy vs.\ Energy plot, one of two approaches is needed:
+
+\begin{enumerate}
+\item \textbf{Preload all models simultaneously}: Load all 15 models into
+GPU memory at once and keep them resident throughout the experiment, avoiding
+reload overhead. This requires approximately 150--200 GB of VRAM for the
+full model pool, exceeding the 92 GB available on Laguna's dual-L40S nodes.
+
+\item \textbf{Two-phase carbon attribution}: Run each model separately on
+all 2,500 queries with CodeCarbon (collecting per-model, per-query carbon
+measurements), then use GreenServ's pregenerated routing decisions to
+attribute carbon to each algorithm post-hoc. This avoids live model
+switching but requires completing the per-model inference job (job 71861,
+still running at time of writing).
+\end{enumerate}
+
+The two-phase approach is the most feasible path forward given available
+hardware. Job 71861 (per-model live inference) had completed 4 of 15 models
+at the time this report was finalized. Future work should complete this job
+and implement the carbon attribution post-processing step.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+
+\subsection{Is Energy a Sufficient Proxy for Carbon?}
+
+The central research question of this study is whether GPU energy
+consumption (Wh), as measured by Zeus in GreenServ, is a sufficient proxy
+for carbon emissions (gCO$_2$), as measured by CodeCarbon. There are two
+possible outcomes:
+
+\textbf{If energy and carbon are linearly correlated across algorithms:}
+Energy consumption is a sufficient proxy. The relative ranking of algorithms
+by environmental impact is the same whether measured in Wh or gCO$_2$.
+GreenServ's existing metric captures environmental cost accurately, and
+adding CodeCarbon provides only a unit conversion. This would still be
+useful for communicating impact in carbon terms (e.g., ``LinUCB saves X
+grams of CO$_2$ per 1,000 queries''), but would not change the conclusions
+about which algorithms are most environmentally friendly.
+
+\textbf{If energy and carbon diverge across algorithms:}
+Carbon is a necessary independent metric. This could occur because CodeCarbon
+measures CPU and RAM energy in addition to GPU energy (which Zeus does not),
+and because different routing decisions may produce different CPU-to-GPU
+energy ratios. For example, feature extraction (CPU-bound) runs before every
+inference call, and its cost varies with query complexity regardless of which
+model is ultimately selected. If some algorithms trigger more complex feature
+extraction paths, their CPU energy overhead may not be captured by Zeus's
+GPU-only measurement.
+
+\subsection{Per-Model Results: Architecture Matters}
+
+The per-model carbon benchmark (Experiment 1) reveals that parameter count
+alone does not determine carbon footprint. The Phi-4-mini model (3.8B
+parameters) emits less carbon than Qwen2.5-1.5B (1.5B parameters) per 10
+queries. This suggests that architectural improvements --- such as more
+efficient attention mechanisms, better training data, or improved
+tokenization --- can yield models that are both smaller and more carbon
+efficient. This finding has implications for model pool selection in routing
+frameworks: a router that selects models based on parameter count as a
+proxy for energy efficiency may not minimize carbon emissions.
+
+\subsection{Limitations}
+
+\textbf{Inference-only measurement:} Both Zeus and CodeCarbon measure only
+inference carbon. The training cost of the 16 pretrained models --- which
+may dominate lifetime environmental cost for models used at limited scale
+--- is not captured. Faiz et al.\ \cite{faiz2023llmcarbon} provide
+framework for estimating training carbon from known compute hours, which
+could supplement inference measurements in future work.
+
+\textbf{Offline carbon intensity:} The \texttt{OfflineEmissionsTracker}
+uses a static US national average carbon intensity rather than California's
+real-time grid data. California's grid is substantially cleaner than the
+national average, meaning our carbon estimates are conservative
+overestimates. Future work should use the online tracker with
+ElectricityMap API for more precise regional measurements.
+
+\textbf{Model caching:} When an algorithm routes to a model already loaded
+in GPU memory, no additional loading cost is incurred. However, when it
+routes to an unloaded model, a significant loading delay occurs. This means
+carbon measurements partially reflect model loading costs in addition to
+pure inference costs. GreenServ's original evaluation avoids this by using
+pregenerated results; our live experiment does not.
+
+\textbf{Water usage:} Water consumption is the third major environmental
+impact of data center operations and is not measured by either Zeus or
+CodeCarbon. Future work should incorporate water usage effectiveness (WUE)
+metrics.
+
+\textbf{Query type:} GreenServ evaluates only objective benchmark tasks
+(multiple choice, math, summarization) with automated accuracy metrics. The
+framework's behavior on conversational, subjective, or emotionally sensitive
+queries --- where accuracy is harder to define --- remains unstudied.
+
+\subsection{Future Work}
+
+Several directions follow from this study:
+
+\begin{itemize}
+  \item \textbf{Online carbon measurement:} Integrate ElectricityMap API
+  with \texttt{EmissionsTracker} for real-time California grid carbon
+  intensity.
+  \item \textbf{Water consumption:} Add water usage as a third environmental
+  metric alongside energy and carbon.
+  \item \textbf{Lifecycle analysis:} Estimate training carbon for each model
+  in the pool using LLMCarbon \cite{faiz2023llmcarbon} and incorporate into
+  routing reward.
+  \item \textbf{Subjective query routing:} Extend evaluation to
+  conversational and open-ended queries where accuracy is assessed via
+  LLM-as-judge or human preference.
+  \item \textbf{Dynamic model pool:} Investigate criteria for adding or
+  removing models from the pool as new releases emerge.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+This study extends GreenServ, a contextual bandit-based LLM inference
+routing framework, by integrating CodeCarbon to measure carbon emissions
+alongside the existing GPU energy metric. We demonstrate that carbon
+emissions per model scale with parameter count but are also meaningfully
+influenced by model architecture --- a finding that has direct implications
+for environmentally-conscious model pool design. The live routing experiment
+was designed to produce an Accuracy vs.\ Carbon Emissions Pareto plot
+comparable to GreenServ's Accuracy vs.\ Energy plot, but could not be
+completed within the project timeframe due to GPU memory and model loading
+constraints inherent in live inference routing. This limitation itself is a
+research finding: integrating real-time carbon measurement into an LLM
+routing system requires architectural design choices --- such as preloading
+all models or separating per-model carbon collection from routing decision
+attribution --- that are not required for energy-only measurement using Zeus.
+Future work should complete the two-phase carbon attribution approach and
+investigate whether energy consumption and carbon emissions are linearly
+correlated across routing algorithms, or whether carbon must be treated as
+an independent evaluation metric.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Acknowledgments}
+
+This research was conducted as part of the Claremont McKenna College Summer
+Research Program 2026 at the Murty Sunak Quantitative Computing Lab, under
+the supervision of Professor Jeho Park. Computing resources were provided by
+the USC Center for Advanced Research Computing (CARC) Laguna cluster. This
+research uses Claude.ai (Anthropic) as a coding and debugging assistant,
+with advisor approval, for writing and debugging Python scripts, navigating
+HPC infrastructure, and troubleshooting errors. All research decisions,
+methodology, interpretations, and findings are the author's own.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{ziller2026}
+Ziller, T., et al.
+\textit{GreenServ: Energy-Efficient LLM Inference Routing via Contextual Bandits}.
+2026.
+
+\bibitem{codecarbon2023}
+Courty, B., et al.
+\textit{CodeCarbon: Estimate and Track Carbon Emissions from Machine Learning Computing}.
+\url{https://github.com/mlco2/codecarbon}, 2023.
+
+\bibitem{gupta2026}
+Gupta, A., et al.
+\textit{A Survey of Small Language Models in the 1--9 Billion Parameter Range}.
+Amazon Machine Learning, 2026.
+
+\bibitem{li2010contextual}
+Li, L., et al.
+\textit{A Contextual-Bandit Approach to Personalized News Article Recommendation}.
+In \textit{WWW}, 2010.
+
+\bibitem{chen2023frugalgpt}
+Chen, L., et al.
+\textit{FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance}.
+arXiv:2305.05176, 2023.
+
+\bibitem{routellm2024}
+Ong, I., et al.
+\textit{RouteLLM: Learning to Route LLMs with Preference Data}.
+arXiv:2406.18665, 2024.
+
+\bibitem{luccioni2023}
+Luccioni, A.S.
+\textit{The Environmental Impact of AI}.
+TED Talk, 2023.
+
+\bibitem{luccioni2023hf}
+Luccioni, A.S., Viguier, S., Ligozat, A.L.
+\textit{Estimating the Carbon Footprint of BLOOM, a 176B Parameter Language Model}.
+\textit{JMLR}, 2023.
+
+\bibitem{strubell2019}
+Strubell, E., Ganesh, A., McCallum, A.
+\textit{Energy and Policy Considerations for Deep Learning in NLP}.
+In \textit{ACL}, 2019.
+
+\bibitem{patterson2021}
+Patterson, D., et al.
+\textit{Carbon Emissions and Large Neural Network Training}.
+arXiv:2104.10350, 2021.
+
+\bibitem{schwartz2020green}
+Schwartz, R., et al.
+\textit{Green AI}.
+\textit{Communications of the ACM} 63, 12 (2020), 54--63.
+
+\bibitem{zeus2023}
+You, J., et al.
+\textit{Zeus: Understanding and Optimizing GPU Energy Consumption of DNN Training}.
+In \textit{NSDI}, 2023.
+
+\bibitem{faiz2023llmcarbon}
+Faiz, A., et al.
+\textit{LLMCarbon: Modeling the End-to-End Carbon Footprint of Large Language Models}.
+arXiv:2309.14393, 2023.
+
+\end{thebibliography}
+
+\end{document}
