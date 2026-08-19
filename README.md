@@ -1,14 +1,14 @@
 # GreenServ Carbon Extension
 
-**Beyond Energy Consumption: Integrating Carbon Emission Measurement into LLM Inference Routing**
+**Carbon Emission as an Evaluation Metric for Environmentally Efficient LLM Inference Routing**
 
-Yuna Jung · Murty Sunak Quantitative Computing Lab · Claremont McKenna College · SRP 2026
+Yuna Jung · Claremont McKenna College · Summer Research Project 2026
 
 ---
 
 ## Overview
 
-This repository extends [GreenServ](https://github.com/TZData1/llm-inference-router) (Ziller et al., 2026), a contextual multi-armed bandit LLM inference routing framework, by integrating [CodeCarbon](https://github.com/mlco2/codecarbon) to measure carbon emissions alongside GreenServ's existing GPU energy metric.
+This repository extends [GreenServ](https://github.com/TZData1/llm-inference-router) (Ziller et al., 2026), a contextual multi-armed bandit LLM inference routing framework, by attempting to integrate [CodeCarbon](https://github.com/mlco2/codecarbon) to measure carbon emissions alongside GreenServ's existing GPU energy metric.
 
 **Research Question:** Is GPU energy consumption (Wh) a sufficient proxy for carbon emissions (gCO₂) when evaluating the environmental friendliness of LLM inference routing algorithms?
 
