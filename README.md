@@ -1,6 +1,6 @@
 # GreenServ Carbon Extension
 
-**Yuna Jung · Murty Sunak Quantitative Computing Lab · CMC SRP 2026**
+**Yuna Jung · Claremont McKenna College Summer Research Project 2026**
 
 Extends [GreenServ](https://github.com/TZData1/llm-inference-router) by integrating [CodeCarbon](https://github.com/mlco2/codecarbon) to measure carbon emissions (gCO₂) alongside GPU energy consumption in LLM inference routing.
 
